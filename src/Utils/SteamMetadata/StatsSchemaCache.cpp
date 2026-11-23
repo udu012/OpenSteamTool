@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <mutex>
 #include <string>
@@ -186,8 +187,94 @@ namespace
         return static_cast<uint32_t>(bits->children.size());
     }
 
+    // ── 带缓存 的 schema/存档 加载器 ────────────────────────────
+    // 按 mtime 缓存整个 KV 根节点：文件没变就直接复用上次解析结果。
+    // 游戏内解锁会改写 UserGameStats 存档（mtime 变化），所以解锁状态
+    // 总能在下一次查询时反映出来。
+    struct CachedFile
+    {
+        std::filesystem::file_time_type mtime;
+        KVNode root;
+        bool   valid = false;
+    };
+
     std::mutex g_cacheMutex;
-    std::unordered_map<uint32_t, uint32_t> g_cache;   // appid -> 成就总数（只存解析成功的）
+    std::unordered_map<uint32_t, uint32_t> g_cache;            // appid -> 成就总数
+    std::unordered_map<std::string, CachedFile> g_fileCache;   // 路径 -> 解析结果
+
+    bool LoadKVFile(const std::string& path, KVNode& root)
+    {
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(path, ec)) return false;
+        if (std::filesystem::file_size(path, ec) > kMaxSchemaFileBytes || ec) return false;
+        const auto mtime = std::filesystem::last_write_time(path, ec);
+        if (ec) return false;
+
+        {
+            std::lock_guard<std::mutex> lock(g_cacheMutex);
+            const auto it = g_fileCache.find(path);
+            if (it != g_fileCache.end() && it->second.valid && it->second.mtime == mtime) {
+                root = it->second.root;
+                return true;
+            }
+        }
+
+        std::ifstream file(path, std::ios::binary);
+        if (!file) return false;
+        std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
+                                   std::istreambuf_iterator<char>());
+        if (data.empty()) return false;
+
+        KVReader reader(data);
+        KVNode parsed;
+        if (!reader.ReadNode(parsed, 0)) return false;
+
+        {
+            std::lock_guard<std::mutex> lock(g_cacheMutex);
+            auto& entry = g_fileCache[path];
+            entry.mtime = mtime;
+            entry.root  = parsed;
+            entry.valid = true;
+        }
+        root = std::move(parsed);
+        return true;
+    }
+
+    // 成就定义：schema 里每个成就 stat → { stat 节点名, bits[{bit 索引, internal_name}] }
+    struct SchemaAchBit
+    {
+        std::string statName;      // stat 节点名，对应存档里的同名节点
+        uint32_t    bitIndex = 0;  // bits 子节点名
+        std::string internalName;  // bits 子节点的 name 字段
+    };
+
+    void CollectSchemaAchievements(const KVNode& root, uint32_t appId,
+                                   std::vector<SchemaAchBit>& out, uint32_t& total)
+    {
+        char appidName[16];
+        snprintf(appidName, sizeof(appidName), "%u", static_cast<unsigned>(appId));
+
+        const KVNode* appNode = root.Find(appidName);
+        if (!appNode) return;
+        const KVNode* stats = appNode->Find("stats");
+        if (!stats) return;
+
+        for (const auto& stat : stats->children) {
+            if (!IsAchievementStat(stat)) continue;
+            const KVNode* bits = stat.Find("bits");
+            if (!bits) continue;
+            for (const auto& bit : bits->children) {
+                SchemaAchBit item;
+                item.statName = stat.name;
+                item.bitIndex = static_cast<uint32_t>(atoi(bit.name.c_str()));
+                if (const KVNode* nm = bit.Find("name"))
+                    item.internalName = nm->stringValue;
+                out.push_back(std::move(item));
+            }
+            total += static_cast<uint32_t>(bits->children.size());
+        }
+    }
+
 } // namespace
 
 namespace StatsSchemaCache
@@ -212,32 +299,12 @@ bool GetAchievementTotal(AppId_t appId, uint32_t& total)
     snprintf(path, sizeof(path), "%s\\appcache\\stats\\UserGameStatsSchema_%u.bin",
              SteamInstallPath, static_cast<unsigned>(appId));
 
-    std::error_code ec;
-    if (!std::filesystem::is_regular_file(path, ec)) return false;
-    if (std::filesystem::file_size(path, ec) > kMaxSchemaFileBytes || ec) return false;
-
-    std::ifstream file(path, std::ios::binary);
-    if (!file) return false;
-    std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
-                               std::istreambuf_iterator<char>());
-    if (data.empty()) return false;
-
-    KVReader reader(data);
     KVNode root;
-    if (!reader.ReadNode(root, 0)) return false;
+    if (!LoadKVFile(path, root)) return false;
 
-    // 根节点下找以 appid 命名的节点 → stats → 逐个 stat 累加成就数
-    char appidName[16];
-    snprintf(appidName, sizeof(appidName), "%u", static_cast<unsigned>(appId));
-
-    const KVNode* appNode = root.Find(appidName);
-    if (!appNode) return false;
-    const KVNode* stats = appNode->Find("stats");
-    if (!stats) return false;
-
+    std::vector<SchemaAchBit> bits;
     uint32_t count = 0;
-    for (const auto& stat : stats->children)
-        count += CountStatAchievements(stat);
+    CollectSchemaAchievements(root, appId, bits, count);
 
     {
         std::lock_guard<std::mutex> lock(g_cacheMutex);
@@ -246,6 +313,117 @@ bool GetAchievementTotal(AppId_t appId, uint32_t& total)
     LOG_ACHIEVEMENT_DEBUG("StatsSchemaCache: appId={} achievement total = {}", appId, count);
 
     total = count;
+    return true;
+}
+
+bool GetRealUnlockState(AppId_t appId, uint32_t steamId3,
+                        std::unordered_map<std::string, RealUnlock>& out)
+{
+    out.clear();
+    if (appId == 0 || SteamInstallPath[0] == '\0') return false;
+
+    // ── 1. schema：成就定义（stat 名 + bit 索引 + internal_name）─────
+    char schemaPath[512];
+    snprintf(schemaPath, sizeof(schemaPath),
+             "%s\\appcache\\stats\\UserGameStatsSchema_%u.bin",
+             SteamInstallPath, static_cast<unsigned>(appId));
+    KVNode schemaRoot;
+    if (!LoadKVFile(schemaPath, schemaRoot)) return false;
+
+    std::vector<SchemaAchBit> bits;
+    uint32_t total = 0;
+    CollectSchemaAchievements(schemaRoot, appId, bits, total);
+    if (bits.empty()) return false;
+
+    // ── 2. 本地解锁存档：优先指定账号，否则取 mtime 最新的 ──────────
+    char statsDir[512];
+    snprintf(statsDir, sizeof(statsDir), "%s\\appcache\\stats", SteamInstallPath);
+
+    std::string bestPath;
+    if (steamId3 != 0) {
+        char p[560];
+        snprintf(p, sizeof(p), "%s\\UserGameStats_%u_%u.bin", statsDir,
+                 static_cast<unsigned>(steamId3), static_cast<unsigned>(appId));
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(p, ec)) bestPath = p;
+    }
+    if (bestPath.empty()) {
+        // 扫描 UserGameStats_*_<appid>.bin，取 mtime 最新的（当前活跃账号
+        // 的存档总会随解锁刷新，所以最新的一定是本账号的）
+        std::error_code ec;
+        std::filesystem::file_time_type bestTime{};
+        for (const auto& entry : std::filesystem::directory_iterator(statsDir, ec)) {
+            if (ec) break;
+            if (!entry.is_regular_file(ec)) continue;
+            const std::string name = entry.path().filename().string();
+            // 前缀 UserGameStats_ 后缀 _<appid>.bin
+            const std::string prefix = "UserGameStats_";
+            const std::string suffix  = "_" + std::to_string(static_cast<unsigned>(appId)) + ".bin";
+            if (name.size() <= prefix.size() + suffix.size()) continue;
+            if (name.compare(0, prefix.size(), prefix) != 0) continue;
+            if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+            if (name.compare(prefix.size(), name.size() - prefix.size() - suffix.size(),
+                             "Schema") == 0)
+                continue;                                     // 排除 schema 文件本身
+            const auto t = entry.last_write_time(ec);
+            if (ec) continue;
+            if (bestPath.empty() || t > bestTime) {
+                bestPath = entry.path().string();
+                bestTime = t;
+            }
+        }
+    }
+    if (bestPath.empty())
+        return false;                                         // 连存档都没有 → 无法确定
+
+    KVNode statsRoot;
+    if (!LoadKVFile(bestPath, statsRoot)) return false;
+
+    // 存档结构：cache → <stat 索引> → { data/pendingbits, AchievementTimes{...} }
+    // DFS 找每个 stat 索引对应的解锁位图与时间表
+    std::unordered_map<std::string, const KVNode*> statNodes;
+    std::function<void(const KVNode&)> walk = [&](const KVNode& node) {
+        for (const auto& child : node.children) {
+            if (child.type != KVType::None) continue;
+            if (child.Find("data") || child.Find("pendingbits") || child.Find("AchievementTimes"))
+                statNodes[child.name] = &child;
+            walk(child);
+        }
+    };
+    walk(statsRoot);
+
+    // ── 3. 合成 internal_name → 解锁状态 ────────────────────────────
+    for (const auto& bit : bits) {
+        RealUnlock u;
+        const auto statIt = statNodes.find(bit.statName);
+        if (statIt != statNodes.end()) {
+            const KVNode* statNode = statIt->second;
+            uint32_t mask = 0;
+            bool hasMask = false;
+            if (const KVNode* pb = statNode->Find("pendingbits")) {
+                mask = static_cast<uint32_t>(pb->int32Value);
+                hasMask = true;
+            }
+            if (const KVNode* d = statNode->Find("data")) {
+                mask = static_cast<uint32_t>(d->int32Value);   // data 是已提交状态
+                hasMask = true;
+            }
+            if (hasMask)
+                u.unlocked = ((mask >> (bit.bitIndex & 31)) & 1u) != 0;
+
+            if (const KVNode* times = statNode->Find("AchievementTimes")) {
+                char idxName[16];
+                snprintf(idxName, sizeof(idxName), "%u", bit.bitIndex);
+                if (const KVNode* t = times->Find(idxName))
+                    u.unlock_time = static_cast<uint32_t>(t->int32Value);
+            }
+        }
+        if (!bit.internalName.empty())
+            out[bit.internalName] = u;
+    }
+
+    LOG_ACHIEVEMENT_DEBUG("StatsSchemaCache: appId={} real unlock state: entries={} archive={}",
+                          appId, out.size(), bestPath);
     return true;
 }
 

@@ -679,6 +679,7 @@ namespace Hooks_NetPacket_UserAchievements {
 
     struct AchDef {
         uint32_t internal_key = 0;
+        std::string internal_name;      // schema internal_name，连接本地解锁存档的键
         uint32_t groupid = 0;
         int32_t  max_progress_int = 0;
         float    max_progress_float = 0.0f;
@@ -792,6 +793,7 @@ namespace Hooks_NetPacket_UserAchievements {
         for (const auto& a : resp.achievements()) {
             AchDef def;
             def.internal_key = a.internal_key();
+            def.internal_name = a.internal_name();
             def.groupid = a.groupid();
             def.max_progress_int = a.max_progress_int();
             def.max_progress_float = a.max_progress_float();
@@ -839,17 +841,52 @@ namespace Hooks_NetPacket_UserAchievements {
         }
         const GameAchCache& cache = cacheIt->second;
 
+        // ── v1.6.4: 优先用本地真实解锁状态 ─────────────────────────
+        // 数据源 UserGameStats_<id3>_<appid>.bin（游戏内 818/819 解锁的落盘
+        // 记录，按 mtime 缓存，解锁新成就后下一次查询立刻生效）。
+        // 拿不到时退回 v1.6.3 的满进度语义（捐赠者旧版行为）。
+        std::unordered_map<std::string, StatsSchemaCache::RealUnlock> realState;
+        const bool haveRealState = StatsSchemaCache::GetRealUnlockState(
+            appId,
+            hdrMsg.has_steamid()
+                ? static_cast<uint32_t>(hdrMsg.steamid() & 0xFFFFFFFFu)
+                : 0,
+            realState);
+        LOG_ACHIEVEMENT_DEBUG("GetUserAchievements response: appId={} realState={} ({} entries)",
+                              appId, haveRealState ? "yes" : "no", realState.size());
+
         CPlayer_GetUserAchievements_Response resp;
         const uint32_t now = static_cast<uint32_t>(time(nullptr));
+        // 每个分组的完成数/完成时间（分组 id → {完成数, 最近解锁时间}）
+        std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> groupDone;
         for (const auto& def : cache.achievements) {
             auto* entry = resp.add_achievements();
             entry->set_internal_key(def.internal_key);
-            entry->set_unlocked(true);
-            entry->set_unlock_time(now);
-            if (def.max_progress_int > 0)
-                entry->set_progress_int(def.max_progress_int);
-            if (def.max_progress_float > 0.0f)
-                entry->set_progress_float(def.max_progress_float);
+
+            bool unlocked = true;                       // 兜底：满进度语义
+            uint32_t unlockTime = now;
+            if (haveRealState) {
+                const auto it = realState.find(def.internal_name);
+                if (it != realState.end()) {            // schema 映射成功 → 用真实值
+                    unlocked = it->second.unlocked;
+                    unlockTime = it->second.unlock_time;
+                }                                       // 映射失败的单项维持满进度
+            }
+            entry->set_unlocked(unlocked);
+            entry->set_unlock_time(unlockTime);
+            if (unlocked) {
+                if (def.max_progress_int > 0)
+                    entry->set_progress_int(def.max_progress_int);
+                if (def.max_progress_float > 0.0f)
+                    entry->set_progress_float(def.max_progress_float);
+                auto& done = groupDone[def.groupid];
+                done.first += 1;
+                if (unlockTime > done.second)
+                    done.second = unlockTime;
+            } else {
+                entry->set_progress_int(0);
+                entry->set_progress_float(0.0f);
+            }
         }
         resp.set_schema_version(cache.schema_version);
         resp.set_schema_hash(cache.schema_hash);
@@ -857,9 +894,12 @@ namespace Hooks_NetPacket_UserAchievements {
             auto* g = resp.add_groups();
             g->set_groupid(gd.groupid);
             g->set_is_achievable(true);
-            g->set_completed_achievements(gd.total_achievements);
-            g->set_is_completed(true);
-            g->set_time_completed(now);
+            const auto done = groupDone.find(gd.groupid);
+            const uint32_t completed = (done != groupDone.end()) ? done->second.first : 0;
+            const uint32_t lastTime = (done != groupDone.end()) ? done->second.second : 0;
+            g->set_completed_achievements(completed);
+            g->set_is_completed(gd.total_achievements > 0 && completed >= gd.total_achievements);
+            g->set_time_completed(g->is_completed() ? lastTime : 0);
         }
 
         hdrMsg.set_eresult(static_cast<int32_t>(k_EResultOK));
