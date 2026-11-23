@@ -229,6 +229,9 @@ namespace
         KVNode parsed;
         if (!reader.ReadNode(parsed, 0)) return false;
 
+        LOG_ACHIEVEMENT_DEBUG("LoadKVFile: parsed OK path='{}' bytes={} rootChildren={}",
+                              path, data.size(), parsed.children.size());
+
         {
             std::lock_guard<std::mutex> lock(g_cacheMutex);
             auto& entry = g_fileCache[path];
@@ -254,14 +257,37 @@ namespace
         char appidName[16];
         snprintf(appidName, sizeof(appidName), "%u", static_cast<unsigned>(appId));
 
+        LOG_ACHIEVEMENT_DEBUG("CollectSchemaAchievements: appId={} appidName='{}' rootChildren={}",
+                              appId, appidName, root.children.size());
+        for (size_t i = 0; i < root.children.size() && i < 8; ++i)
+            LOG_ACHIEVEMENT_DEBUG("CollectSchemaAchievements:   root[{}] name='{}' type={}",
+                                  i, root.children[i].name, static_cast<int>(root.children[i].type));
+
         const KVNode* appNode = root.Find(appidName);
-        if (!appNode) return;
+        if (!appNode) {
+            LOG_ACHIEVEMENT_WARN("CollectSchemaAchievements: appId={} app node '{}' NOT FOUND",
+                                 appId, appidName);
+            return;
+        }
         const KVNode* stats = appNode->Find("stats");
-        if (!stats) return;
+        if (!stats) {
+            LOG_ACHIEVEMENT_WARN("CollectSchemaAchievements: appId={} 'stats' NOT FOUND under '{}'",
+                                 appId, appidName);
+            return;
+        }
+        LOG_ACHIEVEMENT_DEBUG("CollectSchemaAchievements: appId={} stats children={}",
+                              appId, stats->children.size());
 
         for (const auto& stat : stats->children) {
-            if (!IsAchievementStat(stat)) continue;
+            const KVNode* typeStr = stat.Find("type");
             const KVNode* bits = stat.Find("bits");
+            LOG_ACHIEVEMENT_DEBUG("CollectSchemaAchievements: appId={} stat='{}' type={} "
+                                  "typeStr='{}' bits={} isAch={}",
+                                  appId, stat.name, static_cast<int>(stat.type),
+                                  typeStr ? typeStr->stringValue : std::string("(none)"),
+                                  bits ? bits->children.size() : 0u,
+                                  IsAchievementStat(stat) ? "yes" : "no");
+            if (!IsAchievementStat(stat)) continue;
             if (!bits) continue;
             for (const auto& bit : bits->children) {
                 SchemaAchBit item;
@@ -332,6 +358,8 @@ bool GetRealUnlockState(AppId_t appId, uint32_t steamId3,
         LOG_ACHIEVEMENT_WARN("GetRealUnlockState: schema load failed: {}", schemaPath);
         return false;
     }
+    LOG_ACHIEVEMENT_DEBUG("GetRealUnlockState: schemaPath='{}' rootChildren={}",
+                          schemaPath, schemaRoot.children.size());
 
     std::vector<SchemaAchBit> bits;
     uint32_t total = 0;
