@@ -207,6 +207,8 @@ namespace {
     constexpr uint32 HASH_JOB_NotifyRunningApps = Fnv1aHash("FamilyGroupsClient.NotifyRunningApps#1");
     constexpr uint32 HASH_JOB_GetUserStats = Fnv1aHash("Player.GetUserStats#1");
     constexpr uint32 HASH_JOB_GetAchievementsProgress = Fnv1aHash("Player.GetAchievementsProgress#1");
+    constexpr uint32 HASH_JOB_GetGameAchievements = Fnv1aHash("Player.GetGameAchievements#1");
+    constexpr uint32 HASH_JOB_GetUserAchievements = Fnv1aHash("Player.GetUserAchievements#1");
     constexpr uint32 HASH_JOB_GetManifestRequestCode = Fnv1aHash("ContentServerDirectory.GetManifestRequestCode#1");
 
 } // anonymous namespace
@@ -651,6 +653,239 @@ namespace Hooks_NetPacket_AchievementsProgress {
     }
 
 } // namespace Hooks_NetPacket_AchievementsProgress
+
+// ════════════════════════════════════════════════════════════════
+// Hooks_NetPacket_UserAchievements — 2026-11 成就改版后假入库游戏的
+// 库界面成就面板修复（实测版）。
+//
+// netpacket.log 实测（打开假入库游戏页 22:14:41）：
+//   Player.GetGameAchievements#1               → 成就定义，服务器不校验
+//                                                所有权，6843 字节成功返回
+//   Player.GetGlobalAchievementPercentages#1   → 全服百分比，成功
+//   Player.GetUserAchievements#1               → 玩家解锁状态，未拥有 app
+//                                                返回空 body，面板因此消失
+// （Player.GetAchievementsProgress#1 在当前客户端流程中不会被发出，
+//   见上方旧命名空间，保留作为前瞻防御，不参与本次修复。）
+//
+// 注入方案：
+//  1. GetGameAchievements 发送侧记录 jobid→假入库 appid；接收侧解析
+//     成就定义，缓存 internal_key/进度上限/分组/schema_hash。
+//  2. GetUserAchievements 接收侧按缓存合成"满进度"响应（unlocked=true、
+//     unlock_time=now、进度=max、分组全部完成），头部 eresult 补 OK。
+//     缓存缺失（定义未到过）时维持现状不注入。
+//  818/819（游戏内解锁）与 5466（存储上报）路径一概不动。
+// ════════════════════════════════════════════════════════════════
+namespace Hooks_NetPacket_UserAchievements {
+
+    struct AchDef {
+        uint32_t internal_key = 0;
+        uint32_t groupid = 0;
+        int32_t  max_progress_int = 0;
+        float    max_progress_float = 0.0f;
+    };
+
+    struct GroupDef {
+        uint32_t groupid = 0;
+        uint32_t total_achievements = 0;
+    };
+
+    struct GameAchCache {
+        std::vector<AchDef> achievements;
+        std::vector<GroupDef> groups;
+        int32_t  schema_version = 0;
+        uint32_t schema_hash = 0;
+    };
+
+    // 发送/接收都在 CM 网络线程上串行执行（实测 tid 一致），无需加锁。
+    std::unordered_map<AppId_t, GameAchCache> g_GameAchCache;   // appid → 成就定义
+    std::unordered_map<uint64, AppId_t> g_GameAchJobIds;        // GetGameAchievements jobid → appid
+    std::unordered_map<uint64, AppId_t> g_UserAchJobIds;        // GetUserAchievements jobid → appid
+    constexpr size_t kMaxJobEntries = 256;
+
+    void TrimJobMap(std::unordered_map<uint64, AppId_t>& m) {
+        if (m.size() >= kMaxJobEntries)
+            m.clear();
+    }
+
+    // ── Send: Player.GetGameAchievements#1（只记录，不改请求）────
+    bool HandleSend_GameAchievements(const uint8* pBody, uint32 cbBody,
+                                     const uint8* pHdr, uint32 cbHdr)
+    {
+        CPlayer_GetGameAchievements_Request req;
+        if (!req.ParseFromArray(pBody, cbBody)) {
+            LOG_ACHIEVEMENT_WARN("GetGameAchievements request: failed to ParseFromArray");
+            return false;
+        }
+        if (!req.has_appid())
+            return false;
+        const AppId_t appId = req.appid();
+        if (!LuaConfig::HasDepot(appId))
+            return false;                    // 只关心假入库游戏
+        if (req.hash_only())
+            return false;                    // 只要 hash 的响应没有定义可缓存
+
+        CMsgProtoBufHeader hdr;
+        if (!hdr.ParseFromArray(pHdr, cbHdr) || !hdr.has_jobid_source())
+            return false;
+
+        TrimJobMap(g_GameAchJobIds);
+        g_GameAchJobIds[hdr.jobid_source()] = appId;
+        LOG_ACHIEVEMENT_DEBUG("GetGameAchievements request: stored jobid={} -> appid={}",
+                              hdr.jobid_source(), appId);
+        return false;                        // 请求本体不改
+    }
+
+    // ── Send: Player.GetUserAchievements#1（只记录，不改请求）────
+    bool HandleSend_GetUserAchievements(const uint8* pBody, uint32 cbBody,
+                                        const uint8* pHdr, uint32 cbHdr)
+    {
+        CPlayer_GetUserAchievements_Request req;
+        if (!req.ParseFromArray(pBody, cbBody)) {
+            LOG_ACHIEVEMENT_WARN("GetUserAchievements request: failed to ParseFromArray");
+            return false;
+        }
+        if (!req.has_appid())
+            return false;
+        const AppId_t appId = req.appid();
+        if (!LuaConfig::HasDepot(appId))
+            return false;
+
+        CMsgProtoBufHeader hdr;
+        if (!hdr.ParseFromArray(pHdr, cbHdr) || !hdr.has_jobid_source())
+            return false;
+
+        TrimJobMap(g_UserAchJobIds);
+        g_UserAchJobIds[hdr.jobid_source()] = appId;
+        LOG_ACHIEVEMENT_DEBUG("GetUserAchievements request: stored jobid={} -> appid={}",
+                              hdr.jobid_source(), appId);
+        return false;                        // 请求本体不改
+    }
+
+    // ── Recv: Player.GetGameAchievements#1（缓存成就定义）────────
+    void HandleRecv_GameAchievements(const uint8* pHdr, uint32 cbHdr,
+                                     const uint8* pBody, uint32 cbBody)
+    {
+        CMsgProtoBufHeader hdrMsg;
+        if (!hdrMsg.ParseFromArray(pHdr, cbHdr))
+            return;
+        AppId_t appId = 0;
+        if (hdrMsg.has_jobid_target()) {
+            const auto it = g_GameAchJobIds.find(hdrMsg.jobid_target());
+            if (it == g_GameAchJobIds.end())
+                return;                      // 不是我们记录过的请求
+            appId = it->second;
+            g_GameAchJobIds.erase(it);
+        } else {
+            return;
+        }
+
+        CPlayer_GetGameAchievements_Response resp;
+        if (!resp.ParseFromArray(pBody, cbBody)) {
+            LOG_ACHIEVEMENT_WARN("GetGameAchievements response: failed to ParseFromArray");
+            return;
+        }
+
+        GameAchCache cache;
+        cache.schema_version = resp.has_schema_version() ? resp.schema_version() : 0;
+        cache.schema_hash = resp.has_schema_hash() ? resp.schema_hash() : 0;
+        cache.achievements.reserve(resp.achievements().size());
+        for (const auto& a : resp.achievements()) {
+            AchDef def;
+            def.internal_key = a.internal_key();
+            def.groupid = a.groupid();
+            def.max_progress_int = a.max_progress_int();
+            def.max_progress_float = a.max_progress_float();
+            cache.achievements.push_back(def);
+        }
+        for (const auto& g : resp.groups()) {
+            GroupDef gd;
+            gd.groupid = g.groupid();
+            gd.total_achievements = g.total_achievements();
+            cache.groups.push_back(gd);
+        }
+
+        g_GameAchCache[appId] = std::move(cache);
+        LOG_ACHIEVEMENT_DEBUG("GetGameAchievements response: cached appId={} ach={} groups={} schemaHash={:#x}",
+                              appId, g_GameAchCache[appId].achievements.size(),
+                              g_GameAchCache[appId].groups.size(),
+                              g_GameAchCache[appId].schema_hash);
+    }
+
+    // ── Recv: Player.GetUserAchievements#1（合成满进度响应）──────
+    void HandleRecv_GetUserAchievements(const uint8* pHdr, uint32 cbHdr,
+                                        const uint8* pBody, uint32 cbBody)
+    {
+        CMsgProtoBufHeader hdrMsg;
+        if (!hdrMsg.ParseFromArray(pHdr, cbHdr))
+            return;
+        AppId_t appId = 0;
+        if (hdrMsg.has_jobid_target()) {
+            const auto it = g_UserAchJobIds.find(hdrMsg.jobid_target());
+            if (it == g_UserAchJobIds.end())
+                return;
+            appId = it->second;
+            g_UserAchJobIds.erase(it);
+        } else {
+            return;
+        }
+        if (!LuaConfig::HasDepot(appId))
+            return;                          // 正版游戏原样放行
+
+        const auto cacheIt = g_GameAchCache.find(appId);
+        if (cacheIt == g_GameAchCache.end() || cacheIt->second.achievements.empty()) {
+            LOG_ACHIEVEMENT_DEBUG("GetUserAchievements response: appId={} no cached definitions, skip",
+                                  appId);
+            return;                          // 没有定义就不注入，维持现状
+        }
+        const GameAchCache& cache = cacheIt->second;
+
+        CPlayer_GetUserAchievements_Response resp;
+        const uint32_t now = static_cast<uint32_t>(time(nullptr));
+        for (const auto& def : cache.achievements) {
+            auto* entry = resp.add_achievements();
+            entry->set_internal_key(def.internal_key);
+            entry->set_unlocked(true);
+            entry->set_unlock_time(now);
+            if (def.max_progress_int > 0)
+                entry->set_progress_int(def.max_progress_int);
+            if (def.max_progress_float > 0.0f)
+                entry->set_progress_float(def.max_progress_float);
+        }
+        resp.set_schema_version(cache.schema_version);
+        resp.set_schema_hash(cache.schema_hash);
+        for (const auto& gd : cache.groups) {
+            auto* g = resp.add_groups();
+            g->set_groupid(gd.groupid);
+            g->set_is_achievable(true);
+            g->set_completed_achievements(gd.total_achievements);
+            g->set_is_completed(true);
+            g->set_time_completed(now);
+        }
+
+        hdrMsg.set_eresult(static_cast<int32_t>(k_EResultOK));
+        g_cbNewHdr = static_cast<uint32>(hdrMsg.ByteSizeLong());
+        if (g_cbNewHdr > kMaxHdrSize || !hdrMsg.SerializeToArray(g_NewHdr, kMaxHdrSize))
+            return;
+        g_NeedReplaceHdr = true;
+
+        const auto newSize = resp.ByteSizeLong();
+        if (newSize > sizeof(g_NewBody)) {
+            LOG_ACHIEVEMENT_WARN("GetUserAchievements response: synthesized message too large ({} bytes)",
+                                 newSize);
+            g_NeedReplaceHdr = false;
+            return;
+        }
+        if (!resp.SerializeToArray(g_NewBody, sizeof(g_NewBody))) {
+            g_NeedReplaceHdr = false;
+            return;
+        }
+        g_cbNewBody = static_cast<uint32>(newSize);
+        g_NeedReplaceBody = true;
+        LOG_ACHIEVEMENT_DEBUG("GetUserAchievements response: injected appId={} achievements={} groups={}",
+                              appId, resp.achievements().size(), resp.groups().size());
+    }
+
+} // namespace Hooks_NetPacket_UserAchievements
 
 
 // ════════════════════════════════════════════════════════════════
@@ -1668,6 +1903,12 @@ namespace {
         case HASH_JOB_GetAchievementsProgress:
             return Hooks_NetPacket_AchievementsProgress::HandleSend(pBody, cbBody, pHdr, cbHdr);
 
+        case HASH_JOB_GetGameAchievements:
+            return Hooks_NetPacket_UserAchievements::HandleSend_GameAchievements(pBody, cbBody, pHdr, cbHdr);
+
+        case HASH_JOB_GetUserAchievements:
+            return Hooks_NetPacket_UserAchievements::HandleSend_GetUserAchievements(pBody, cbBody, pHdr, cbHdr);
+
         case HASH_JOB_GetManifestRequestCode:
             return Hooks_NetPacket_Manifest::HandleSend(pBody, cbBody, pHdr, cbHdr);
 
@@ -1676,6 +1917,10 @@ namespace {
         // job 名版本号升位（#2 等）时按子串兜底，保证记录点不漏
         if (std::string_view(targetJobName).find("GetAchievementsProgress") != std::string_view::npos)
             return Hooks_NetPacket_AchievementsProgress::HandleSend(pBody, cbBody, pHdr, cbHdr);
+        if (std::string_view(targetJobName).find("GetGameAchievements") != std::string_view::npos)
+            return Hooks_NetPacket_UserAchievements::HandleSend_GameAchievements(pBody, cbBody, pHdr, cbHdr);
+        if (std::string_view(targetJobName).find("GetUserAchievements") != std::string_view::npos)
+            return Hooks_NetPacket_UserAchievements::HandleSend_GetUserAchievements(pBody, cbBody, pHdr, cbHdr);
         return false;
     }
 
@@ -1749,6 +1994,14 @@ namespace {
             Hooks_NetPacket_AchievementsProgress::HandleRecv(pHdr, cbHdr, pBody, cbBody);
             return;
 
+        case HASH_JOB_GetGameAchievements:
+            Hooks_NetPacket_UserAchievements::HandleRecv_GameAchievements(pHdr, cbHdr, pBody, cbBody);
+            return;
+
+        case HASH_JOB_GetUserAchievements:
+            Hooks_NetPacket_UserAchievements::HandleRecv_GetUserAchievements(pHdr, cbHdr, pBody, cbBody);
+            return;
+
         case HASH_JOB_GetManifestRequestCode:
             Hooks_NetPacket_Manifest::HandleRecv(pBody, cbBody, pHdr, cbHdr);
             return;
@@ -1762,6 +2015,14 @@ namespace {
             }
             if (std::string_view(targetJobName).find("GetAchievementsProgress") != std::string_view::npos) {
                 Hooks_NetPacket_AchievementsProgress::HandleRecv(pHdr, cbHdr, pBody, cbBody);
+                return;
+            }
+            if (std::string_view(targetJobName).find("GetGameAchievements") != std::string_view::npos) {
+                Hooks_NetPacket_UserAchievements::HandleRecv_GameAchievements(pHdr, cbHdr, pBody, cbBody);
+                return;
+            }
+            if (std::string_view(targetJobName).find("GetUserAchievements") != std::string_view::npos) {
+                Hooks_NetPacket_UserAchievements::HandleRecv_GetUserAchievements(pHdr, cbHdr, pBody, cbBody);
                 return;
             }
             break;
