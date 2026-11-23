@@ -1,5 +1,6 @@
 #include "Hooks_NetPacket.h"
 #include "Utils/SteamMetadata/ManifestClient.h"
+#include "Utils/SteamMetadata/StatsSchemaCache.h"
 #include "Utils/Config/Config.h"
 #include "Hooks_Misc.h"
 #include "Hooks_Package.h"
@@ -13,6 +14,7 @@
 #include <chrono>
 #include <excpt.h>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <filesystem>
 #include <format>
@@ -204,6 +206,7 @@ namespace {
     // ── Hash constants for target_job_name dispatch ─────────────
     constexpr uint32 HASH_JOB_NotifyRunningApps = Fnv1aHash("FamilyGroupsClient.NotifyRunningApps#1");
     constexpr uint32 HASH_JOB_GetUserStats = Fnv1aHash("Player.GetUserStats#1");
+    constexpr uint32 HASH_JOB_GetAchievementsProgress = Fnv1aHash("Player.GetAchievementsProgress#1");
     constexpr uint32 HASH_JOB_GetManifestRequestCode = Fnv1aHash("ContentServerDirectory.GetManifestRequestCode#1");
 
 } // anonymous namespace
@@ -487,6 +490,167 @@ namespace Hooks_NetPacket_UserStats {
     }
 
 } // namespace Hooks_NetPacket_UserStats
+
+
+// ════════════════════════════════════════════════════════════════
+//  Hooks_NetPacket_AchievementsProgress
+//
+//  2026-11 Steam 客户端"成就合集"改版后，库界面游戏页的成就进度展示
+//  （游戏时间旁边那块）改走 Player.GetAchievementsProgress#1 批量查询，
+//  服务器对未拥有的 app 不返回数据，假入库游戏的成就面板因此消失。
+//
+//  Send: eMsg 151 (Player.GetAchievementsProgress#1)
+//        只记录 jobid_source -> 请求里的假入库 appid，不改请求本体，
+//        保证同一批请求里正版游戏的进度数据不受影响。
+//  Recv: eMsg 147 (Player.GetAchievementsProgress#1)
+//        匹配 jobid 后，为假入库 app 补写/覆盖 AchievementProgress 条目：
+//          total   ← 本地 schema 缓存（appcache/stats/UserGameStatsSchema_<appid>.bin）
+//          unlocked ← CloudRedirect 启用时用其同步的成就状态；
+//                     未启用时按旧版"捐赠者满进度"语义置为 total。
+//        头部 eresult 补成 OK。
+//  818/819（游戏内解锁）与 5466（存储上报）路径一概不动。
+// ════════════════════════════════════════════════════════════════
+namespace Hooks_NetPacket_AchievementsProgress {
+
+    // jobid_source -> 待注入的假入库 appid（响应到达即消费）
+    std::unordered_map<uint64, std::vector<AppId_t>> g_JobIdToLuaAppIds;
+    constexpr size_t kMaxJobEntries = 1024;
+
+    bool HandleSend(const uint8* pBody, uint32 cbBody,
+                    const uint8* pHdr, uint32 cbHdr)
+    {
+        CPlayer_GetAchievementsProgress_Request req;
+        if (!req.ParseFromArray(pBody, cbBody)) {
+            LOG_ACHIEVEMENT_WARN("AchievementsProgress request: failed to ParseFromArray");
+            return false;
+        }
+        LOG_ACHIEVEMENT_DEBUG("AchievementsProgress request: appids={}", req.appids().size());
+
+        // 收集请求里处于假入库名单且未真实拥有的 appid
+        std::vector<AppId_t> luaApps;
+        for (uint32 raw : req.appids()) {
+            const AppId_t appId = static_cast<AppId_t>(raw);
+            if (LuaConfig::HasDepot(appId))
+                luaApps.push_back(appId);
+        }
+        if (luaApps.empty())
+            return false;
+
+        CMsgProtoBufHeader hdr;
+        if (!hdr.ParseFromArray(pHdr, cbHdr) || !hdr.has_jobid_source()) {
+            LOG_ACHIEVEMENT_WARN("AchievementsProgress request: no jobid_source, skip");
+            return false;
+        }
+
+        if (g_JobIdToLuaAppIds.size() >= kMaxJobEntries)
+            g_JobIdToLuaAppIds.clear();
+        g_JobIdToLuaAppIds[hdr.jobid_source()] = std::move(luaApps);
+        LOG_ACHIEVEMENT_DEBUG("AchievementsProgress request: stored jobid={} ({} lua app(s))",
+                              hdr.jobid_source(), g_JobIdToLuaAppIds[hdr.jobid_source()].size());
+        return false;   // 请求本体不改
+    }
+
+    void HandleRecv(const uint8* pHdr, uint32 cbHdr,
+                    const uint8* pBody, uint32 cbBody)
+    {
+        CMsgProtoBufHeader hdrMsg;
+        if (!hdrMsg.ParseFromArray(pHdr, cbHdr)) {
+            LOG_ACHIEVEMENT_WARN("AchievementsProgress response: failed to ParseFromArray header");
+            return;
+        }
+
+        std::vector<AppId_t> luaApps;
+        if (hdrMsg.has_jobid_target()) {
+            const uint64 jobId = hdrMsg.jobid_target();
+            const auto it = g_JobIdToLuaAppIds.find(jobId);
+            if (it == g_JobIdToLuaAppIds.end())
+                return;   // 不是我们记录过的请求，原样放行
+            luaApps = std::move(it->second);
+            g_JobIdToLuaAppIds.erase(it);
+        } else {
+            return;
+        }
+
+        CPlayer_GetAchievementsProgress_Response resp;
+        if (!resp.ParseFromArray(pBody, cbBody)) {
+            LOG_ACHIEVEMENT_WARN("AchievementsProgress response: failed to ParseFromArray body");
+            return;
+        }
+
+        const uint32_t now = static_cast<uint32_t>(time(nullptr));
+        bool changed = false;
+
+        for (AppId_t appId : luaApps) {
+            uint32_t total = 0;
+            if (!StatsSchemaCache::GetAchievementTotal(appId, total) || total == 0) {
+                // 本地没有 schema 就不知道总数，注入反而会显示 0/0，
+                // 不如维持现状（无面板）。schema 在游戏跑过一次后就会出现。
+                LOG_ACHIEVEMENT_DEBUG("AchievementsProgress response: appId={} has no local schema, skip",
+                                      appId);
+                continue;
+            }
+
+            uint32_t unlocked = total;
+            if (CloudRedirectHost::IsActive()) {
+                CloudRedirectHost::AchievementBlock blocks[64];
+                const uint32_t n = CloudRedirectHost::GetAchievements(appId, blocks, 64);
+                uint32_t crUnlocked = 0;
+                for (uint32_t i = 0; i < n; i++) {
+                    uint32_t bits = blocks[i].bits;
+                    while (bits) { crUnlocked += bits & 1u; bits >>= 1; }
+                }
+                if (n > 0) {
+                    unlocked = (crUnlocked < total) ? crUnlocked : total;
+                    LOG_ACHIEVEMENT_DEBUG("AchievementsProgress response: appId={} CR unlocked={}/{}",
+                                          appId, crUnlocked, total);
+                }
+            }
+
+            // 覆盖已有条目，否则追加
+            CPlayer_GetAchievementsProgress_Response_AchievementProgress* entry = nullptr;
+            for (auto& p : *resp.mutable_achievement_progress()) {
+                if (p.appid() == appId) { entry = &p; break; }
+            }
+            if (!entry)
+                entry = resp.add_achievement_progress();
+
+            entry->set_appid(appId);
+            entry->set_unlocked(unlocked);
+            entry->set_total(total);
+            entry->set_percentage(static_cast<float>(unlocked) * 100.0f / static_cast<float>(total));
+            entry->set_all_unlocked(unlocked >= total);
+            entry->set_cache_time(now);
+            changed = true;
+            LOG_ACHIEVEMENT_DEBUG("AchievementsProgress response: injected appId={} {}/{}",
+                                  appId, unlocked, total);
+        }
+
+        if (!changed)
+            return;
+
+        // 头部 eresult 补成 OK（批请求含正版 app 时服务器通常已回 OK，此处兜底）
+        hdrMsg.set_eresult(static_cast<int32_t>(k_EResultOK));
+        g_cbNewHdr = static_cast<uint32>(hdrMsg.ByteSizeLong());
+        if (g_cbNewHdr > kMaxHdrSize || !hdrMsg.SerializeToArray(g_NewHdr, kMaxHdrSize))
+            return;
+        g_NeedReplaceHdr = true;
+
+        const auto newSize = resp.ByteSizeLong();
+        if (newSize > sizeof(g_NewBody)) {
+            LOG_ACHIEVEMENT_WARN("AchievementsProgress response: modified message too large ({} bytes)", newSize);
+            g_NeedReplaceHdr = false;
+            return;
+        }
+        if (!resp.SerializeToArray(g_NewBody, sizeof(g_NewBody))) {
+            g_NeedReplaceHdr = false;
+            return;
+        }
+        g_cbNewBody = static_cast<uint32>(newSize);
+        g_NeedReplaceBody = true;
+        LOG_ACHIEVEMENT_DEBUG("AchievementsProgress response: patched ({} entries)", resp.achievement_progress().size());
+    }
+
+} // namespace Hooks_NetPacket_AchievementsProgress
 
 
 // ════════════════════════════════════════════════════════════════
@@ -1501,11 +1665,17 @@ namespace {
         case HASH_JOB_GetUserStats:
             return Hooks_NetPacket_UserStats::HandleSend_GetUserStats(pBody, cbBody, pHdr, cbHdr);
 
+        case HASH_JOB_GetAchievementsProgress:
+            return Hooks_NetPacket_AchievementsProgress::HandleSend(pBody, cbBody, pHdr, cbHdr);
+
         case HASH_JOB_GetManifestRequestCode:
             return Hooks_NetPacket_Manifest::HandleSend(pBody, cbBody, pHdr, cbHdr);
 
         // ---- add new 151 service methods here ----
         }
+        // job 名版本号升位（#2 等）时按子串兜底，保证记录点不漏
+        if (std::string_view(targetJobName).find("GetAchievementsProgress") != std::string_view::npos)
+            return Hooks_NetPacket_AchievementsProgress::HandleSend(pBody, cbBody, pHdr, cbHdr);
         return false;
     }
 
@@ -1575,6 +1745,10 @@ namespace {
             Hooks_NetPacket_UserStats::HandleRecv_GetUserStatsResponse(pHdr, cbHdr, pBody, cbBody);
             return;
 
+        case HASH_JOB_GetAchievementsProgress:
+            Hooks_NetPacket_AchievementsProgress::HandleRecv(pHdr, cbHdr, pBody, cbBody);
+            return;
+
         case HASH_JOB_GetManifestRequestCode:
             Hooks_NetPacket_Manifest::HandleRecv(pBody, cbBody, pHdr, cbHdr);
             return;
@@ -1584,6 +1758,10 @@ namespace {
             // job 名带版本号后缀时走子串兜底，保证观测点不漏
             if (std::string_view(targetJobName).find("NotifyRunningApps") != std::string_view::npos) {
                 Hooks_NetPacket_FamilySharing::LogRunningApps(pBody, cbBody);
+                return;
+            }
+            if (std::string_view(targetJobName).find("GetAchievementsProgress") != std::string_view::npos) {
+                Hooks_NetPacket_AchievementsProgress::HandleRecv(pHdr, cbHdr, pBody, cbBody);
                 return;
             }
             break;
