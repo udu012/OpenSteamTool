@@ -63,10 +63,13 @@ opensteamtool_add_ipc_codegen(IPC_GEN
 )
 
 # ---------------------------------------------------------------------------
-# Protobuf code generation — one variant per config, from the same .proto:
+# Protobuf code generation — full runtime in every config (was lite in Release):
 #
-#   Debug   → full Message     (protoc --cpp_out)       → links libprotobuf
-#   Release → lite MessageLite (protoc --cpp_out=lite:) → links libprotobuf-lite
+#   all configs → full Message (protoc --cpp_out) → links libprotobuf
+#
+# Release previously generated lite MessageLite, which forced LOG_* to no-ops
+# (lite lacks DebugString/TextFormat used by the log calls). With logging now
+# compiled into Release as well, the full runtime is required there too.
 #
 # Output lands in the per-config generated/ dir (same root as the IPC header),
 # so each config owns its own files. A shared output path would ping-pong
@@ -81,7 +84,7 @@ add_custom_command(
            "${PROTO_GEN_DIR}/steam_messages.pb.h"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${PROTO_GEN_DIR}"
     COMMAND $<TARGET_FILE:protoc>
-        "--cpp_out=$<$<CONFIG:Release>:lite:>${PROTO_GEN_DIR}"
+        "--cpp_out=${PROTO_GEN_DIR}"
         "-I${CMAKE_CURRENT_SOURCE_DIR}/proto"
         "${PROTO_SRC}"
     DEPENDS "${PROTO_SRC}" protoc
@@ -163,10 +166,9 @@ target_include_directories(OpenSteamTool PRIVATE
 target_link_libraries(OpenSteamTool PRIVATE
     OSTPlatform
     lua_static
-    $<$<CONFIG:Debug>:libprotobuf>
-    $<$<CONFIG:Release>:libprotobuf-lite>
+    libprotobuf
     tomlplusplus::tomlplusplus
-    $<$<CONFIG:Debug>:spdlog::spdlog>
+    spdlog::spdlog
 )
 
 # Logging was Debug-only; now enabled in all configs so Release builds can be
