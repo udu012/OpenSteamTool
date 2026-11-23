@@ -169,10 +169,12 @@ target_link_libraries(OpenSteamTool PRIVATE
     $<$<CONFIG:Debug>:spdlog::spdlog>
 )
 
-# Logging is compiled in only for Debug; Release reduces LOG_* to no-ops.
+# Logging was Debug-only; now enabled in all configs so Release builds can be
+# diagnosed in the field. Log volume/level is still controlled at runtime by
+# opensteamtool.toml (log_level), defaulting to debug.
 # 版本号同时以宏的形式带进编译，诊断日志据此打印版本。
 target_compile_definitions(OpenSteamTool PRIVATE
-    $<$<CONFIG:Debug>:OPENSTEAMTOOL_LOGGING_ENABLED>
+    OPENSTEAMTOOL_LOGGING_ENABLED
     OPENSTEAMTOOL_VERSION="${OPENSTEAMTOOL_VERSION}"
 )
 
