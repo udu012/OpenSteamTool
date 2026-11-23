@@ -78,7 +78,10 @@ namespace
         explicit KVReader(const std::vector<uint8_t>& data) : m_data(data) {}
 
         // 逐字段读取，任何越界/畸形输入都返回 false，绝不抛异常。
-        bool ReadNode(KVNode& out, int depth)
+        // v1.6.7 修复：容器内容直接读进 out（节点自身的 children），
+        // 旧实现 ReadNode(node.children.emplace_back()) 会多出一层匿名
+        // 包装节点，导致 Find("stats")/Find("bits") 全部落空。
+        bool ReadNodes(std::vector<KVNode>& out, int depth)
         {
             if (depth > kMaxDepth) return false;
 
@@ -94,7 +97,7 @@ namespace
 
                 switch (node.type) {
                 case KVType::None:
-                    if (!ReadNode(node.children.emplace_back(), depth + 1))
+                    if (!ReadNodes(node.children, depth + 1))
                         return false;
                     break;
                 case KVType::String:
@@ -118,7 +121,7 @@ namespace
                     return false;
                 }
 
-                out.children.push_back(std::move(node));
+                out.push_back(std::move(node));
             }
         }
 
@@ -227,7 +230,7 @@ namespace
 
         KVReader reader(data);
         KVNode parsed;
-        if (!reader.ReadNode(parsed, 0)) return false;
+        if (!reader.ReadNodes(parsed.children, 0)) return false;
 
         LOG_ACHIEVEMENT_DEBUG("LoadKVFile: parsed OK path='{}' bytes={} rootChildren={}",
                               path, data.size(), parsed.children.size());
