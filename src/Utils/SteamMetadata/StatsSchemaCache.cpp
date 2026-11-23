@@ -328,12 +328,18 @@ bool GetRealUnlockState(AppId_t appId, uint32_t steamId3,
              "%s\\appcache\\stats\\UserGameStatsSchema_%u.bin",
              SteamInstallPath, static_cast<unsigned>(appId));
     KVNode schemaRoot;
-    if (!LoadKVFile(schemaPath, schemaRoot)) return false;
+    if (!LoadKVFile(schemaPath, schemaRoot)) {
+        LOG_ACHIEVEMENT_WARN("GetRealUnlockState: schema load failed: {}", schemaPath);
+        return false;
+    }
 
     std::vector<SchemaAchBit> bits;
     uint32_t total = 0;
     CollectSchemaAchievements(schemaRoot, appId, bits, total);
-    if (bits.empty()) return false;
+    if (bits.empty()) {
+        LOG_ACHIEVEMENT_WARN("GetRealUnlockState: no schema achievements appId={}", appId);
+        return false;
+    }
 
     // ── 2. 本地解锁存档：优先指定账号，否则取 mtime 最新的 ──────────
     char statsDir[512];
@@ -374,10 +380,17 @@ bool GetRealUnlockState(AppId_t appId, uint32_t steamId3,
         }
     }
     if (bestPath.empty())
+    {
+        LOG_ACHIEVEMENT_WARN("GetRealUnlockState: archive not found appId={} steamId3={}",
+                             appId, steamId3);
         return false;                                         // 连存档都没有 → 无法确定
+    }
 
     KVNode statsRoot;
-    if (!LoadKVFile(bestPath, statsRoot)) return false;
+    if (!LoadKVFile(bestPath, statsRoot)) {
+        LOG_ACHIEVEMENT_WARN("GetRealUnlockState: archive load failed: {}", bestPath);
+        return false;
+    }
 
     // 存档结构：cache → <stat 索引> → { data/pendingbits, AchievementTimes{...} }
     // DFS 找每个 stat 索引对应的解锁位图与时间表
@@ -391,6 +404,8 @@ bool GetRealUnlockState(AppId_t appId, uint32_t steamId3,
         }
     };
     walk(statsRoot);
+    if (statNodes.empty())
+        LOG_ACHIEVEMENT_WARN("GetRealUnlockState: no stat nodes found in archive: {}", bestPath);
 
     // ── 3. 合成 internal_name → 解锁状态 ────────────────────────────
     for (const auto& bit : bits) {
